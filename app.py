@@ -118,6 +118,7 @@ SUPPORTED_LANGUAGES: dict[str, dict[str, str]] = {
     "fr-fr": {"name": "French",       "espeak": "fr-fr"},
     "de":    {"name": "German",       "espeak": "de"},
     "ar":    {"name": "Arabic",       "espeak": "ar"},
+    "ko":    {"name": "Korean",       "espeak": "ko"},
 }
 
 

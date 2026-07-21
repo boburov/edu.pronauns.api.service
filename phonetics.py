@@ -228,6 +228,16 @@ _LANG_EQUIVALENTS: dict[str, tuple[tuple[frozenset[str], float], ...]] = {
         (frozenset("ɟɡg"), 0.90),
         (frozenset("ɫl"), 0.95),
     ),
+    # Korean has ONE liquid phoneme (ㄹ): [ɾ] between vowels, [l] in the coda —
+    # so the global r/l contrast must not apply here. espeak's Korean voice
+    # also writes ㄱ as a uvular /q/ where every speaker produces [k]~[ɡ], and
+    # ㅎ can surface as a pharyngeal.
+    "ko": (
+        (frozenset("ɾrɹlɫ"), 0.95),
+        (frozenset("qkɡg"), 0.92),
+        (frozenset("ħh"), 0.95),
+        (frozenset("ʌəɐa"), 0.90),  # ㅓ/ㅏ are transcribed inconsistently
+    ),
 }
 
 # Languages whose writing system omits short vowels: espeak's reference has no

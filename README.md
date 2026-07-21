@@ -24,10 +24,17 @@ they are directly comparable.
 ## Supported languages
 
 English (`en-us`), Russian (`ru`), Turkish (`tr`), Spanish (`es`),
-French (`fr-fr`), German (`de`), Arabic (`ar`).
+French (`fr-fr`), German (`de`), Arabic (`ar`), Korean (`ko`).
 
 Add more by extending `SUPPORTED_LANGUAGES` in `app.py` (map a code to an
-espeak-ng voice).
+espeak-ng voice). If the new language has accent variants that espeak spells
+differently from how learners actually speak, add them to `_LANG_EQUIVALENTS`
+in `phonetics.py` — that is what keeps Spanish *seseo* or the single Korean
+liquid ㄹ from being scored as mistakes.
+
+> Accuracy is highest for the languages with plenty of Common Voice data
+> (English, Russian, German, French, Spanish, Arabic). Korean has little, so
+> the phoneme model runs closer to zero-shot there and scores are noisier.
 
 ## Install
 
