@@ -57,6 +57,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+# Normalisation + scoring live in `phonetics.py` — pure functions over IPA
+# symbols, driven by articulatory features, shared by every supported language.
+from phonetics import alignment_score, normalize_phonemes
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("pronunciation")
 
@@ -68,6 +72,18 @@ MODEL_ID = "facebook/wav2vec2-lv-60-espeak-cv-ft"
 TARGET_SR = 16_000          # wav2vec2 expects 16 kHz mono
 MAX_DURATION_S = 10.0       # reject anything longer than this
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 5 * 1024 * 1024))  # 5 MB
+
+# --- Audio conditioning ----------------------------------------------------- #
+# Recorders (phone and browser alike) start the stream at the exact moment the
+# user taps, so the very first consonant is often half-swallowed. wav2vec2 also
+# needs a little context before the first sound. Padding both ends with silence
+# measurably recovers word-initial consonants (/h/, /b/ ...).
+PAD_S = float(os.environ.get("PAD_SECONDS", 0.30))
+# Phone microphones record quietly; normalising the peak gives the model a
+# consistent input level regardless of device or how far the user held it.
+TARGET_PEAK = 0.95
+# Below this peak the clip is silence/noise, not speech.
+SILENCE_PEAK = 0.005
 
 # --- Concurrency / backpressure (tuned for CPU-only, bursty traffic) --------- #
 # CPU inference is the bottleneck. We run a bounded number of assessments in
@@ -235,7 +251,27 @@ def decode_audio(raw: bytes) -> np.ndarray:
     if duration < 0.1:
         raise AssessmentError("Audio too short — please record the whole word.", 400)
 
-    return data.astype(np.float32)
+    return condition_audio(data.astype(np.float32))
+
+
+def condition_audio(data: np.ndarray) -> np.ndarray:
+    """Level-normalise and pad the clip so the model hears the whole word.
+
+    Two cheap fixes that together buy a lot of accuracy:
+      * peak normalisation — quiet phone recordings reach the level the model
+        was trained on;
+      * silence padding — the first phoneme is no longer clipped by the
+        recorder starting late (measured: word-initial /h/, /b/ come back).
+    """
+    peak = float(np.max(np.abs(data))) if data.size else 0.0
+    if peak < SILENCE_PEAK:
+        raise AssessmentError(
+            "No speech detected — check the microphone and speak louder.", 400
+        )
+    data = data * (TARGET_PEAK / peak)
+
+    pad = np.zeros(int(TARGET_SR * PAD_S), dtype=np.float32)
+    return np.concatenate([pad, data, pad])
 
 
 # --------------------------------------------------------------------------- #
@@ -293,39 +329,6 @@ def reference_phonemes(word: str, espeak_code: str) -> str:
     return phonemes
 
 
-def normalize_phonemes(text: str) -> str:
-    """Collapse whitespace and strip stress/length marks for fair comparison."""
-    # Remove common IPA stress and length markers that add noise to the score.
-    for ch in ("ˈ", "ˌ", "ː", "ˑ", "'", "-"):
-        text = text.replace(ch, " ")
-    return " ".join(text.split())
-
-
-def levenshtein_ratio(predicted: str, reference: str) -> float:
-    """Token-level Levenshtein similarity ratio in [0, 1].
-
-    Operates on phoneme tokens (not characters). Uses the classic ratio
-    2 * LCS / (len_a + len_b), i.e. the indel-based Levenshtein.ratio.
-    """
-    a = predicted.split()
-    b = reference.split()
-    if not a and not b:
-        return 1.0
-    if not a or not b:
-        return 0.0
-
-    # Longest Common Subsequence length (space-optimised DP).
-    prev = [0] * (len(b) + 1)
-    for token_a in a:
-        curr = [0] * (len(b) + 1)
-        for j, token_b in enumerate(b, start=1):
-            if token_a == token_b:
-                curr[j] = prev[j - 1] + 1
-            else:
-                curr[j] = max(prev[j], curr[j - 1])
-        prev = curr
-    lcs = prev[len(b)]
-    return (2.0 * lcs) / (len(a) + len(b))
 
 
 def verdict_for(accuracy: float) -> str:
@@ -375,13 +378,16 @@ class HealthResponse(BaseModel):
 # Endpoints
 # --------------------------------------------------------------------------- #
 
-def _assess_sync(raw: bytes, word: str, espeak_code: str) -> tuple[float, str, str]:
+def _assess_sync(
+    raw: bytes, word: str, espeak_code: str, lang: str
+) -> tuple[float, str, str]:
     """The heavy, fully-blocking pipeline. Runs in a worker thread, never on the
     event loop. Returns (accuracy, predicted_phonemes, reference_phonemes)."""
     samples = decode_audio(raw)               # ffmpeg subprocess (releases GIL)
     ref = reference_phonemes(word, espeak_code)  # cached; espeak on miss
     pred = predict_phonemes(samples)          # torch inference (releases GIL)
-    accuracy = round(levenshtein_ratio(pred, ref) * 100.0, 1)
+    # `lang` enables that language's accent equivalences when scoring.
+    accuracy = round(alignment_score(pred, ref, lang) * 100.0, 1)
     return accuracy, pred, ref
 
 
@@ -433,7 +439,7 @@ async def assess(
         # loop stays free to accept new connections and serve /health, /static.
         async with _semaphore:
             accuracy, pred, ref = await asyncio.to_thread(
-                _assess_sync, raw, word, espeak_code
+                _assess_sync, raw, word, espeak_code, lang
             )
     finally:
         _pending -= 1
