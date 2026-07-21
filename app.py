@@ -82,8 +82,14 @@ PAD_S = float(os.environ.get("PAD_SECONDS", 0.30))
 # Phone microphones record quietly; normalising the peak gives the model a
 # consistent input level regardless of device or how far the user held it.
 TARGET_PEAK = 0.95
-# Below this peak the clip is silence/noise, not speech.
-SILENCE_PEAK = 0.005
+# --- "Is this actually speech?" thresholds (measured, see check_is_speech) --- #
+# Below this RMS the clip is silence.
+SILENCE_RMS = 0.004
+# Frame-to-frame spectral movement. Speech scored 0.31-0.47 across all seven
+# languages; a stationary tone (emulator's fake mic) 0.03; silence 0.00.
+MIN_SPEECH_FLUX = float(os.environ.get("MIN_SPEECH_FLUX", 0.15))
+# Spectral flatness ~1.0 means white noise. Speech topped out at 0.58.
+MAX_NOISE_FLATNESS = float(os.environ.get("MAX_NOISE_FLATNESS", 0.75))
 
 # --- Concurrency / backpressure (tuned for CPU-only, bursty traffic) --------- #
 # CPU inference is the bottleneck. We run a bounded number of assessments in
@@ -120,12 +126,19 @@ SUPPORTED_LANGUAGES: dict[str, dict[str, str]] = {
 # --------------------------------------------------------------------------- #
 
 class AssessmentError(Exception):
-    """Raised for expected, user-facing failures -> becomes a clean 4xx JSON."""
+    """Raised for expected, user-facing failures -> becomes a clean 4xx JSON.
 
-    def __init__(self, message: str, status_code: int = 400) -> None:
+    `code` is a stable machine-readable tag so clients can localise the message
+    (the API itself stays English).
+    """
+
+    def __init__(
+        self, message: str, status_code: int = 400, code: str = "error"
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
+        self.code = code
 
 
 # --------------------------------------------------------------------------- #
@@ -185,7 +198,10 @@ app.add_middleware(
 
 @app.exception_handler(AssessmentError)
 async def assessment_error_handler(_: Request, exc: AssessmentError) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.message, "code": exc.code},
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -254,6 +270,64 @@ def decode_audio(raw: bytes) -> np.ndarray:
     return condition_audio(data.astype(np.float32))
 
 
+def spectral_flux(data: np.ndarray) -> float:
+    """Average frame-to-frame change of the (normalised) spectrum.
+
+    Speech is never stationary — the spectrum moves with every phoneme. A
+    constant tone (an Android emulator's fake microphone, a hum, a beep) or
+    silence barely moves at all. Measured: speech 0.31-0.47 in every supported
+    language, emulator test tone 0.03, digital silence 0.00.
+    """
+    frame, hop = 400, 160  # 25 ms window, 10 ms hop at 16 kHz
+    if data.size < frame * 3:
+        return 1.0  # too short to judge — let the model decide
+    frames = np.lib.stride_tricks.sliding_window_view(data, frame)[::hop]
+    spectra = np.abs(np.fft.rfft(frames * np.hanning(frame), axis=1))
+    spectra /= spectra.sum(axis=1, keepdims=True) + 1e-12
+    return float(np.abs(np.diff(spectra, axis=0)).sum(axis=1).mean())
+
+
+def spectral_flatness(data: np.ndarray) -> float:
+    """Geometric/arithmetic mean of the spectrum: ~1.0 for white noise."""
+    spectrum = np.abs(np.fft.rfft(data * np.hanning(data.size))) + 1e-9
+    return float(np.exp(np.log(spectrum).mean()) / spectrum.mean())
+
+
+def check_is_speech(data: np.ndarray) -> None:
+    """Reject recordings that contain no speech, with an actionable message.
+
+    Without this the pipeline happily returns "0%" for a broken microphone,
+    which reads to the learner as "your pronunciation is terrible" instead of
+    "your microphone is not working".
+    """
+    rms = float(np.sqrt(np.mean(data**2))) if data.size else 0.0
+    if rms < SILENCE_RMS:
+        raise AssessmentError(
+            "The recording is silent — check the microphone permission and "
+            "speak closer to the device.",
+            400,
+            code="too_quiet",
+        )
+
+    if spectral_flux(data) < MIN_SPEECH_FLUX:
+        raise AssessmentError(
+            "No speech in the recording — the microphone captured a constant "
+            "tone or silence. On an Android emulator, enable Extended Controls "
+            "> Microphone > 'Virtual microphone uses host audio input', or test "
+            "on a real device.",
+            400,
+            code="not_speech",
+        )
+
+    if spectral_flatness(data) > MAX_NOISE_FLATNESS:
+        raise AssessmentError(
+            "The recording is mostly noise — move somewhere quieter and try "
+            "again.",
+            400,
+            code="too_noisy",
+        )
+
+
 def condition_audio(data: np.ndarray) -> np.ndarray:
     """Level-normalise and pad the clip so the model hears the whole word.
 
@@ -263,11 +337,9 @@ def condition_audio(data: np.ndarray) -> np.ndarray:
       * silence padding — the first phoneme is no longer clipped by the
         recorder starting late (measured: word-initial /h/, /b/ come back).
     """
-    peak = float(np.max(np.abs(data))) if data.size else 0.0
-    if peak < SILENCE_PEAK:
-        raise AssessmentError(
-            "No speech detected — check the microphone and speak louder.", 400
-        )
+    check_is_speech(data)
+
+    peak = float(np.max(np.abs(data)))
     data = data * (TARGET_PEAK / peak)
 
     pad = np.zeros(int(TARGET_SR * PAD_S), dtype=np.float32)
@@ -290,7 +362,19 @@ def predict_phonemes(audio: np.ndarray) -> str:
         logits = state.model(inputs.input_values).logits
     predicted_ids = torch.argmax(logits, dim=-1)
     decoded = state.processor.batch_decode(predicted_ids)[0]
-    return normalize_phonemes(decoded)
+    phonemes = normalize_phonemes(decoded)
+
+    # The model produced nothing recognisable. Returning "0%" here would tell
+    # the learner their pronunciation is hopeless when in reality the audio
+    # never contained intelligible speech — say so instead.
+    if not phonemes:
+        raise AssessmentError(
+            "Could not make out any speech — record again, a little louder and "
+            "closer to the microphone.",
+            400,
+            code="unrecognized",
+        )
+    return phonemes
 
 
 @lru_cache(maxsize=8192)
